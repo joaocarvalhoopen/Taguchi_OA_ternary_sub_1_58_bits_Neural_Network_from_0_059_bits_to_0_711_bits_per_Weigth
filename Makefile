@@ -8,8 +8,8 @@ clean:
 	rm -f ./taguchi_mnist_odin.exe
 
 run_train:
-	./taguchi_mnist_odin.exe train mnist model.bin 2
-	# ./taguchi_mnist_odin.exe train mnist model.bin 300
+	# ./taguchi_mnist_odin.exe train mnist model.bin 2
+	./taguchi_mnist_odin.exe train mnist model.bin 300
 
 run_infer:
 	./taguchi_mnist_odin.exe infer mnist model.bin test 222
