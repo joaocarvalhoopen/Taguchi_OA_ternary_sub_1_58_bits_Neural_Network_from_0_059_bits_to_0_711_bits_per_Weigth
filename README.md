@@ -15,6 +15,8 @@ High compression Weight encoded training with Orthogonal Arrays, Taguchi of tern
 ## How to compile and run
 
 ```
+NOTE: You have to unzip the mnist file into a mnist diretory.
+
 Build:
     odin build . -out:taguchi_ternary_mnist_neural_network.exe -o:speed -no-bounds-check
 
