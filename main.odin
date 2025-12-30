@@ -1075,7 +1075,11 @@ job_forward :: proc ( tid  : int,
 				cq_off   := ( o * L.blocks + block ) * L.K
 
 				dot := 0
+
+				// aqui
+				assert( L.K == K_USED_DEFAULT )
 				for k in 0 ..< L.K {
+				// #unroll for k in 0 ..< K_USED_DEFAULT {
 
 					a := int( L.basis[base_row + k ] )
 					c := int( L.cq[ cq_off + k ] )
