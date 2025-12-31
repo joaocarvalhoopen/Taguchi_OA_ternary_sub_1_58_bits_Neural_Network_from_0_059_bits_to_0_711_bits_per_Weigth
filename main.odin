@@ -1046,7 +1046,293 @@ Fwd_Ctx :: struct {
 	pre   : [ ]f32,
 }
 
-job_forward :: proc ( tid  : int,
+
+WCache_Ctx :: struct {
+
+    L : ^OA_Linear,
+    w : [ ]f32,        // len = out_dim * blocks * N
+}
+
+job_build_wcache :: proc ( tid  : int,
+	                       nt   : int,
+		                   ctxp : rawptr ) {
+
+    ctx := ( ^WCache_Ctx )( ctxp )
+    L := ctx.L
+
+    groups := L.out_dim * L.blocks    // ( o, block )
+    gs : int
+    ge : int
+    chunk_range( groups, tid, nt, & gs, & ge )
+
+    for g := gs; g < ge; g += 1 {
+
+        o     := g / L.blocks
+        block := g - o * L.blocks
+
+        cq_off := (o*L.blocks + block) * L.K
+
+        // w block base
+        w_off := g * L.N
+
+        // para cada n, faz o dot(A[n,*], cq[o,block,*])
+        for n in 0 ..< L.N {
+
+            base_row := n * L.K
+            dot := 0
+
+            assert( L.K == K_USED_DEFAULT )
+            for k in 0 ..< L.K {
+
+            	dot += int( L.basis[ base_row + k ] ) * int( L.cq[ cq_off + k ] )
+            }
+            ctx.w[ w_off + n ] = f32( dot ) * L.inv_sqrtK
+        }
+    }
+}
+
+FwdCache_Ctx :: struct {
+
+	L     : ^OA_Linear,
+    x     : []f32,
+    batch : int,
+    y     : [ ]f32,
+    pre   : [ ]f32,
+    w     : [ ]f32,    // w_cache len = out * blocks * N
+}
+
+
+import simd "core:simd"
+
+// AVX2 version on amd64; we will keep a scalar fallback for other architectures.
+when ODIN_ARCH == .amd64 {
+
+	load_f32x8_unaligned :: #force_inline proc "contextless"( p : ^f32 ) ->
+	                                                          simd.f32x8 {
+
+		// This pointer-cast pattern is commonly lowered by LLVM to unaligned loads.
+     	// If your Odin version provides simd.load_unaligned, prefer that.
+      	return ( ^simd.f32x8 )( rawptr( p ) )^
+	}
+
+	hsum_f32x8 :: #force_inline proc "contextless"( v : simd.f32x8 ) ->
+                                                     f32 {
+
+		// NOTE: reduce_add ( nonexistent ) -> use one of the provided reductions.
+     	// pairs is typically fast and well-parallelized.
+      	return simd.reduce_add_pairs( v )
+	}
+
+    // We can also try: @(enable_target_feature="avx2,fma")
+    // if we want the compiler to be allowed to fuse mul+add ( when available ).
+    // @(enable_target_feature="avx2")
+    @(enable_target_feature="avx2,fma")
+    job_forward_cached :: proc ( tid  : int,
+                                 nt   : int,
+                                 ctxp : rawptr ) {
+
+        ctx := ( ^FwdCache_Ctx )( ctxp )
+        L   := ctx.L
+
+        s0 : int
+        s1 : int
+        chunk_range( ctx.batch, tid, nt, & s0, & s1 )
+
+        for s := s0; s < s1; s += 1 {
+
+            xs := ctx.x[ s * L.in_dim    : ( s + 1 ) * L.in_dim ]
+            ys := ctx.y[ s * L.out_dim   : ( s + 1 ) * L.out_dim ]
+            ps := ctx.pre[ s * L.out_dim : ( s + 1 ) * L.out_dim ]
+
+            for o in 0 ..< L.out_dim {
+
+                acc_total : f32 = 0
+
+                for block in 0 ..< L.blocks {
+
+                    i0 := block * L.N
+                    if i0 >= L.in_dim {
+
+                    	break
+                    }
+                    i1 := i0 + L.N
+                    if i1 > L.in_dim {
+
+                    	i1 = L.in_dim
+                    }
+                    nlen := i1 - i0
+
+                    g      := o * L.blocks + block
+                    w_base := g * L.N
+                    wblk   := ctx.w[ w_base : w_base + L.N ]   // Slice com N ( mesmo no último bloco )
+
+                    i := i0
+                    n := 0
+
+                    accv0 : simd.f32x8 = {}
+                    accv1 : simd.f32x8 = {}
+
+                    // Unroll 16 floats
+                    for ( n + 15 ) < nlen {
+
+                        xv0 := load_f32x8_unaligned( & xs[ i ] )
+                        wv0 := load_f32x8_unaligned( & wblk[ n ] )
+                        xv1 := load_f32x8_unaligned( & xs[ i + 8 ] )
+                        wv1 := load_f32x8_unaligned( & wblk[ n + 8 ] )
+
+                        accv0 += xv0 * wv0
+                        accv1 += xv1 * wv1
+
+                        i += 16
+                        n += 16
+                    }
+
+                    // Mais 8 floats
+                    for ( n + 7 ) < nlen {
+
+                        xv := load_f32x8_unaligned( & xs[ i ] )
+                        wv := load_f32x8_unaligned( & wblk[ n ] )
+                        accv0 += xv * wv
+                        i += 8
+                        n += 8
+                    }
+
+                    acc_block := hsum_f32x8( accv0 + accv1 )
+
+                    // Tail escalar
+                    for n < nlen {
+
+                        acc_block += xs[ i ] * wblk[ n ]
+                        i += 1
+                        n += 1
+                    }
+
+                    acc_total += acc_block
+                }
+
+                ps[ o ] = acc_total
+                ys[ o ] = L.bias[ o ] + L.scale[ o ] * acc_total
+            }
+        }
+    }
+
+} else {
+
+    // Non-amd64 fallback : We will keep the original scalar code here.
+    job_forward_cached :: proc ( tid  : int,
+                                 nt   : int,
+                                 ctxp : rawptr ) {
+
+        ctx := ( ^FwdCache_Ctx )( ctxp )
+        L := ctx.L
+
+        s0 : int
+        s1 : int
+        chunk_range( ctx.batch, tid, nt, & s0, & s1 )
+
+        for s := s0; s < s1; s += 1 {
+
+            xs := ctx.x  [ s * L.in_dim  : ( s + 1 ) * L.in_dim ]
+            ys := ctx.y  [ s * L.out_dim : ( s + 1 ) * L.out_dim ]
+            ps := ctx.pre[ s * L.out_dim : ( s + 1 ) * L.out_dim ]
+
+            for o in 0 ..< L.out_dim {
+
+                acc : f32 = 0
+                for block in 0 ..< L.blocks {
+
+                    i0 := block * L.N
+                    if i0 >= L.in_dim {
+
+                    	break
+                    }
+                    i1 := i0 + L.N
+                    if i1 > L.in_dim {
+
+                    	i1 = L.in_dim
+                    }
+
+                    g := o * L.blocks + block
+                    wblk := ctx.w[ g * L.N : g * L.N + L.N ]
+
+                    for i := i0; i < i1; i += 1 {
+
+                        n := i - i0
+                        acc += xs[ i ] * wblk[ n ]
+                    }
+                }
+                ps[ o ] = acc
+                ys[ o ] = L.bias[ o ] + L.scale[ o ] * acc
+            }
+        }
+    }
+}
+
+
+/*
+
+job_forward_cached :: proc ( tid  : int,
+	                         nt   : int,
+							 ctxp : rawptr ) {
+
+    ctx := ( ^FwdCache_Ctx )( ctxp )
+    L := ctx.L
+
+    s0 : int
+    s1 : int
+    chunk_range( ctx.batch, tid, nt, & s0, & s1 )
+
+    for s := s0; s < s1; s += 1 {
+
+        xs := ctx.x[ s * L.in_dim : ( s + 1 ) * L.in_dim ]
+        ys := ctx.y[ s * L.out_dim : ( s + 1 ) * L.out_dim ]
+        ps := ctx.pre[ s * L.out_dim : ( s + 1 ) * L.out_dim ]
+
+        // Goes along all outputs.
+        for o in 0 ..< L.out_dim {
+
+        	acc : f32 = 0
+
+            // Goes along the blocks.
+            for block in 0 ..< L.blocks {
+
+                i0 := block * L.N
+                if i0 >= L.in_dim {
+
+                	break
+                }
+                i1 := i0 + L.N
+                if i1 > L.in_dim {
+
+                	i1 = L.in_dim
+                }
+
+                // w_cache para este ( o, block )
+                g := o * L.blocks + block
+                wblk := ctx.w[ g * L.N : g * L.N + L.N ]
+
+                // Sums in the block ( until N, or less in the last block )
+                // NOTE : n == i - i0
+                for i := i0; i < i1; i += 1 {
+
+                    n   := i - i0
+                    acc += xs[ i ] * wblk[ n ]
+                }
+            }
+
+            ps[ o ] = acc
+            ys[ o ] = L.bias[ o ] + L.scale[ o ]*acc
+        }
+    }
+}
+
+*/
+
+
+/*
+
+job_forward :: proc "contextless" (
+                      tid  : int,
                       nt   : int,
                       ctxp : rawptr ) {
 
@@ -1093,6 +1379,9 @@ job_forward :: proc ( tid  : int,
 		}
 	}
 }
+
+*/
+
 
 //
 // ReLU forward / backward parallel
@@ -1210,6 +1499,7 @@ Zero_Grad_Ctx :: struct {
     L : ^OA_Linear
 }
 
+/*
 job_zero_grads :: proc ( tid  : int,
                          nt   : int,
                          ctxp : rawptr ) {
@@ -1235,6 +1525,8 @@ job_zero_grads :: proc ( tid  : int,
 		}
 	}
 }
+
+*/
 
 // Backward : g_bias / g_scale parallel by outputs
 GBias_Scale_Ctx :: struct {
@@ -1269,6 +1561,8 @@ job_gbias_gscale :: proc ( tid  : int,
 		L.g_scale[ o ] = gs
 	}
 }
+
+/*
 
 // Backward: g_coef parallel by outputs
 GCoef_Ctx :: struct {
@@ -1320,16 +1614,96 @@ job_gcoef :: proc ( tid  : int,
 					}
 				}
 
-				// Unique per ( o, block, k) since we partition by o => no race
-				L.g_coef[ cq_off + k ] += acc
+				// Unique per ( o, block, k ) since we partition by o => no race
+				L.g_coef[ cq_off + k ] = acc
 			}
 		}
 	}
 }
 
+*/
+
+MAX_N :: 243 // supports up to m=5 (3^5=243). Increase if you use bigger m.
+
+GCoefFast_Ctx :: struct {
+
+    L     : ^OA_Linear,
+    x     : [ ]f32,       // [ batch, in ]
+    dY    : [ ]f32,       // [ batch, out ]
+    batch : int,
+}
+
+job_gcoef_fast :: proc( tid  : int,
+	                    nt   : int,
+						ctxp : rawptr ) {
+
+    ctx := ( ^GCoefFast_Ctx )( ctxp )
+    L := ctx.L
+
+    o0 : int
+    o1 : int
+    chunk_range( L.out_dim, tid, nt, & o0, & o1 )
+
+    xsum_buf : [ MAX_N ]f32
+
+    for o := o0; o < o1; o += 1 {
+
+        so := L.scale[ o ]
+
+        for block := 0; block < L.blocks; block += 1 {
+
+            i0 := block * L.N
+            if i0 >= L.in_dim {
+
+            	break
+            }
+            i1 := i0 + L.N
+            if i1 > L.in_dim {
+
+            	i1 = L.in_dim
+            }
+            nlen := i1 - i0
+
+            xsum := xsum_buf[ : nlen ]
+            for n in 0 ..< nlen {
+
+            	xsum[ n ] = 0
+            }
+
+            // xsum[ n ] = SUM_s ( dY[ s,o ] * so ) * x[ s, i0 + n ]
+            for s := 0; s < ctx.batch; s += 1 {
+
+                g  := ctx.dY[ s * L.out_dim + o ] * so
+                xs := ctx.x[ s * L.in_dim : ( s + 1 ) * L.in_dim ]
+                for i := i0; i < i1; i += 1 {
+
+                    xsum[ i - i0 ] += g * xs[ i ]
+                }
+            }
+
+            cq_off := ( o * L.blocks + block ) * L.K
+
+            // g_coef[k] = (Σ_n A[n,k]*xsum[n]) * inv_sqrtK
+            for k := 0; k < L.K; k += 1 {
+
+                dot : f32 = 0
+                for n := 0; n < nlen; n += 1 {
+
+                    dot += f32( int( L.basis[ n * L.K + k ] ) ) * xsum[ n ]
+                }
+
+                L.g_coef[ cq_off + k ] = dot * L.inv_sqrtK
+            }
+        }
+    }
+}
+
 //
 // backward: dX parallel by samples
 //
+
+/*
+
 DX_Ctx :: struct {
 
 	L     : ^OA_Linear,
@@ -1378,6 +1752,66 @@ job_dx :: proc ( tid  : int,
 		}
 	}
 }
+
+*/
+
+DXCache_Ctx :: struct {
+
+    L     : ^OA_Linear,
+    dY    : [ ]f32,    // [batch, out]
+    batch : int,
+    dX    : [ ]f32,    // [batch, in]
+    w     : [ ]f32,    // w_cache len = out_dim * blocks * N
+}
+
+job_dx_cached :: proc( tid  : int,
+	                   nt   : int,
+					   ctxp : rawptr ) {
+
+    ctx := ( ^DXCache_Ctx )( ctxp )
+    L := ctx.L
+
+    s0 : int
+    s1 : int
+    chunk_range( ctx.batch, tid, nt, & s0, & s1 )
+
+    for s := s0; s < s1; s += 1 {
+
+        dxs := ctx.dX[ s * L.in_dim : ( s + 1 ) * L.in_dim ]
+
+        // Iterate blocks ( better locality )
+        for block := 0; block < L.blocks; block += 1 {
+
+            i0 := block * L.N
+            if i0 >= L.in_dim {
+
+                break
+            }
+            i1 := i0 + L.N
+            if i1 > L.in_dim {
+
+            	i1 = L.in_dim
+            }
+            nlen := i1 - i0
+
+            // For each position inside this block
+            for n := 0; n < nlen; n += 1 {
+
+            	acc: f32 = 0
+
+                // Sum over outputs
+                for o := 0; o < L.out_dim; o += 1 {
+
+                	g := ctx.dY[ s * L.out_dim + o ] * L.scale[ o ]
+                    acc += g * ctx.w[ ( o * L.blocks + block ) * L.N + n ]
+                }
+
+                dxs[ i0 + n ] = acc
+            }
+        }
+    }
+}
+
 
 // Adam update parallel for big arrays ( coef )
 Adam_Ctx :: struct {
@@ -1436,6 +1870,8 @@ oalinear_quantize_coef_par :: proc ( pool : ^Thread_Pool,
 	pool_run( pool, job_quantize, & q )
 }
 
+/*
+
 oalinear_forward_par :: proc ( pool  : ^Thread_Pool,
                                L     : ^OA_Linear,
                                x     : [ ]f32,
@@ -1454,6 +1890,65 @@ oalinear_forward_par :: proc ( pool  : ^Thread_Pool,
 	}
 
 	pool_run( pool, job_forward, & f )
+}
+
+*/
+
+oalinear_forward_par_cached :: proc	(
+								    pool    : ^Thread_Pool,
+								    L       : ^OA_Linear,
+								    x       : [ ]f32,
+								    batch   : int,
+								    y       : [ ]f32,
+								    pre     : [ ]f32,
+								    w_cache : [ ]f32 ) {    // Now its a reusable buffer.
+
+    // Quantize coef -> cq
+    oalinear_quantize_coef_par( pool, L )
+
+    // Build cache
+    wc := WCache_Ctx{
+
+    	L = L,
+        w = w_cache
+    }
+
+    pool_run( pool, job_build_wcache, & wc )
+
+    // Forward cached
+    f := FwdCache_Ctx{
+
+    	L     = L,
+        x     = x,
+        batch = batch,
+        y     = y,
+        pre   = pre,
+        w     = w_cache
+    }
+
+    pool_run( pool, job_forward_cached, & f )
+}
+
+oalinear_forward_par_use_cache :: proc(
+									    pool    : ^Thread_Pool,
+									    L       : ^OA_Linear,
+									    x       : []f32,
+									    batch   : int,
+									    y       : []f32,
+									    pre     : []f32,
+									    w_cache : []f32	) {
+
+    f := FwdCache_Ctx{
+
+        L     = L,
+        x     = x,
+        batch = batch,
+        y     = y,
+        pre   = pre,
+        w     = w_cache,
+    }
+
+    pool_run( pool, job_forward_cached, & f )
 }
 
 relu_forward_par :: proc ( pool : ^Thread_Pool,
@@ -1503,6 +1998,7 @@ softmax_xent_par :: proc ( pool    : ^Thread_Pool,
 	return loss_sum / f32( batch )
 }
 
+/*
 oalinear_zero_grads_par :: proc ( pool : ^Thread_Pool,
                                   L    : ^OA_Linear ) {
 
@@ -1513,6 +2009,10 @@ oalinear_zero_grads_par :: proc ( pool : ^Thread_Pool,
 	pool_run( pool, job_zero_grads, & z )
 }
 
+*/
+
+/*
+
 oalinear_backward_par :: proc ( pool  : ^Thread_Pool,
                                 L     : ^OA_Linear,
                                 x     : [ ]f32,
@@ -1521,7 +2021,7 @@ oalinear_backward_par :: proc ( pool  : ^Thread_Pool,
                                 batch : int,
                                 dX    : [ ]f32 ) {
 
-	oalinear_zero_grads_par( pool, L )
+	// oalinear_zero_grads_par( pool, L )
 
 	bs := GBias_Scale_Ctx{
 
@@ -1533,14 +2033,14 @@ oalinear_backward_par :: proc ( pool  : ^Thread_Pool,
 
 	pool_run( pool, job_gbias_gscale, & bs )
 
-	gc := GCoef_Ctx{
+	gc := GCoefFast_Ctx{
 
 	    L     = L,
 		x     = x,
 	    dY    = dY,
 		batch = batch
 	}
-	pool_run( pool, job_gcoef, & gc )
+	pool_run( pool, job_gcoef_fast, & gc )
 
 	dx := DX_Ctx{
 
@@ -1551,6 +2051,50 @@ oalinear_backward_par :: proc ( pool  : ^Thread_Pool,
 	}
 
 	pool_run( pool, job_dx, & dx )
+}
+
+*/
+
+
+oalinear_backward_par_cached :: proc(
+								    pool    : ^Thread_Pool,
+								    L       : ^OA_Linear,
+								    x       : [ ]f32,
+								    pre     : [ ]f32,
+								    dY      : [ ]f32,
+								    batch   : int,
+								    dX      : [ ]f32,
+								    w_cache : [ ]f32 ) {
+    // gbias / gscale
+    bs := GBias_Scale_Ctx{
+
+        L     = L,
+        pre   = pre,
+        dY    = dY,
+        batch = batch,
+    }
+    pool_run( pool, job_gbias_gscale, & bs )
+
+    // gcoef
+    gc := GCoefFast_Ctx{
+
+        L     = L,
+        x     = x,
+        dY    = dY,
+        batch = batch,
+    }
+    pool_run( pool, job_gcoef_fast, & gc )
+
+    // dX using the SAME cache built in forward
+    dx := DXCache_Ctx{
+
+        L     = L,
+        dY    = dY,
+        batch = batch,
+        dX    = dX,
+        w     = w_cache,
+    }
+    pool_run( pool, job_dx_cached, & dx )
 }
 
 oalinear_adam_step_par :: proc ( pool : ^Thread_Pool,
@@ -1974,6 +2518,13 @@ build_mnist_paths :: proc ( folder        : string,
 	return
 }
 
+wcache_size :: proc ( L : ^OA_Linear ) ->
+                      int {
+
+	// Cache stores one f32 per ( out, block, n ) where n in [ 0 .. N )
+	return L.out_dim * L.blocks * L.N
+}
+
 evaluate_accuracy_par :: proc ( pool  : ^Thread_Pool,
                                 L1    : ^OA_Linear,
                                 L2    : ^OA_Linear,
@@ -2013,6 +2564,42 @@ evaluate_accuracy_par :: proc ( pool  : ^Thread_Pool,
 		delete( p3 )
 	}
 
+	w1 := make( [ ]f32, wcache_size( L1 ) )
+    w2 := make( [ ]f32, wcache_size( L2 ) )
+    w3 := make( [ ]f32, wcache_size( L3 ) )
+    defer {
+
+    	delete( w1 )
+        delete( w2 )
+        delete( w3 )
+    }
+
+    // Build caches once
+    oalinear_quantize_coef_par( pool, L1 )
+    wc1 := WCache_Ctx{
+
+    	L = L1,
+        w = w1
+    }
+    pool_run( pool, job_build_wcache, & wc1 )
+
+    oalinear_quantize_coef_par( pool, L2 )
+    wc2 := WCache_Ctx{
+
+    	L = L2,
+     	w = w2
+    }
+    pool_run( pool, job_build_wcache, & wc2 )
+
+    oalinear_quantize_coef_par( pool, L3 )
+    wc3 := WCache_Ctx{
+
+    	L = L3,
+     	w = w3
+    }
+    pool_run( pool, job_build_wcache, & wc3 )
+
+
 	correct := 0
 	total   := 0
 
@@ -2039,13 +2626,13 @@ evaluate_accuracy_par :: proc ( pool  : ^Thread_Pool,
 			}
 		}
 
-		oalinear_forward_par( pool, L1, x, bsz, z1, p1 )
+		oalinear_forward_par_use_cache( pool, L1, x, bsz, z1, p1, w1 )
 		relu_forward_par( pool, z1[ 0 : bsz * H1 ], a1[ 0 : bsz * H1 ] )
 
-		oalinear_forward_par( pool, L2, a1, bsz, z2, p2 )
+		oalinear_forward_par_use_cache( pool, L2, a1, bsz, z2, p2, w2 )
 		relu_forward_par( pool, z2[ 0 : bsz * H2 ], a2[ 0 : bsz * H2 ] )
 
-		oalinear_forward_par( pool, L3, a2, bsz, logits, p3 )
+		oalinear_forward_par_use_cache( pool, L3, a2, bsz, logits, p3, w3 )
 
 		for s in 0 ..< bsz {
 
@@ -2242,6 +2829,17 @@ main :: proc() {
 			delete( dx0 )
 		}
 
+		w1 := make( [ ]f32, wcache_size( & L1 ) )
+        w2 := make( [ ]f32, wcache_size( & L2 ) )
+        w3 := make( [ ]f32, wcache_size( & L3 ) )
+
+        defer {
+
+        	delete( w1 )
+            delete( w2 )
+            delete( w3 )
+        }
+
 		perm := make( [ ]int, train.count )
 		defer delete( perm )
 		for i in 0 ..< train.count {
@@ -2264,6 +2862,9 @@ main :: proc() {
 			epoch_loss_sum : f32 = 0
 			seen := 0
 
+			yb_all := make( [ ]u8, batch )
+            defer delete( yb_all )
+
 			for start := 0; start < train.count; start += batch {
 
 				bsz := batch
@@ -2276,8 +2877,21 @@ main :: proc() {
 				    continue
 			    }
 
-				yb := make( [ ]u8, bsz )
-				defer delete( yb )
+				// yb := make( [ ]u8, bsz )
+				// defer delete( yb )
+
+
+
+				yb := yb_all[ : bsz ]
+
+				/*
+				for s in 0 ..< bsz {
+
+                	idx    := perm[ start + s ]
+				    yb[ s ] = train.labels[ idx ]
+				}
+
+				*/
 
 				for s := 0; s < bsz; s += 1 {
 
@@ -2292,13 +2906,13 @@ main :: proc() {
 				}
 
 				// Forward ( parallel )
-				oalinear_forward_par( & pool, & L1, x, bsz, z1, p1 )
+				oalinear_forward_par_cached( & pool, & L1, x, bsz, z1, p1, w1 )
 				relu_forward_par( & pool, z1[ 0 : bsz * H1 ], a1[ 0 : bsz * H1 ] )
 
-				oalinear_forward_par( & pool, & L2, a1, bsz, z2, p2 )
+				oalinear_forward_par_cached( & pool, & L2, a1, bsz, z2, p2, w2 )
 				relu_forward_par( & pool, z2[ 0 : bsz * H2 ], a2[ 0 : bsz * H2 ] )
 
-				oalinear_forward_par( & pool, & L3, a2, bsz, logits, p3 )
+				oalinear_forward_par_cached( & pool, & L3, a2, bsz, logits, p3, w3 )
 
 				// Loss + dlogits ( parallel )
 				loss := softmax_xent_par( & pool, logits[ 0 : bsz * OUT ], yb, bsz, dlogits[ 0 : bsz * OUT ] )
@@ -2306,15 +2920,15 @@ main :: proc() {
 				seen += bsz
 
 				// Backward ( parallel )
-				oalinear_backward_par( & pool, & L3, a2, p3, dlogits, bsz, da2 )
+				oalinear_backward_par_cached( & pool, & L3, a2, p3, dlogits, bsz, da2, w3 )
 				relu_backward_par( & pool, a2[ 0 : bsz * H2 ], da2[ 0 : bsz * H2 ] )
 				copy( dz2[ 0 : bsz * H2 ], da2[ 0 : bsz * H2 ] )
 
-				oalinear_backward_par( & pool, & L2, a1, p2, dz2, bsz, da1 )
+				oalinear_backward_par_cached( & pool, & L2, a1, p2, dz2, bsz, da1, w2 )
 				relu_backward_par( & pool, a1[ 0 : bsz * H1 ], da1[ 0 : bsz * H1 ] )
 				copy( dz1[ 0 : bsz * H1 ], da1[ 0 : bsz * H1 ] )
 
-				oalinear_backward_par( & pool, & L1, x, p1, dz1, bsz, dx0 )
+				oalinear_backward_par_cached( & pool, & L1, x, p1, dz1, bsz, dx0, w1 )
 
 				// Adam step with log schedule
 				step += 1

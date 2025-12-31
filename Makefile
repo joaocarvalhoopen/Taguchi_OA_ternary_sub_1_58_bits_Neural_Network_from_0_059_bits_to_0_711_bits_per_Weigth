@@ -2,7 +2,7 @@ all:
 	odin build . -out:taguchi_mnist_odin.exe -o:speed
 
 opti:
-	odin build . -out:taguchi_mnist_odin.exe -o:speed -no-bounds-check
+	odin build . -out:taguchi_mnist_odin.exe -o:speed -no-bounds-check -microarch=native
 
 clean:
 	rm -f ./taguchi_mnist_odin.exe
